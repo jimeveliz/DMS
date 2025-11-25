@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="Description" content="Actividad inyectada en el período comprendido entre agosto de 2024 y la fecha actual, en relación al peso del paciente. Variacion antes y despues de implementar IA." />
+  <title>Actividad inyectada en relacion al peso </title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    body { margin: 24px; }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    .canvas-wrap { height: 520px; }
+    #status, #stats-a, #stats-b { margin-top: 8px; opacity:.85; font-size:.95rem; }
+    code { background:#f4f4f4; padding:2px 6px; border-radius:4px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Actividad inyectada en relacion al peso </h1>
+    <p>
+      Diferenciado por estudios PET reconstruido con IA: 
+      <strong>antes</strong> de <em>2025-03</em> vs <strong>desde</strong> <em>2025-03</em> en adelante.
+    </p>
+
+    <div class="canvas-wrap"><canvas id="chart-all"></canvas></div>
+    <button id="btnPNG">Descargar PNG</button>
+
+    <div id="stats-a"></div>
+    <div id="stats-b"></div>
+    <div id="status"></div>
+  </div>
+
+  <script>
+    // ===========================
+    // Configuración básica
+    // ===========================
+    const API_URL = "/pet";              // Cambiar si tu API está en otro host/ruta
+    const CUTOFF_Y = 2025, CUTOFF_M = 3, CUTOFF_D = 21; // 21 de marzo de 2025
+    const CUTOFF_KEY = CUTOFF_Y*10000 + CUTOFF_M*100 + CUTOFF_D;
+    
+    // Referencia global al gráfico (para el botón de descarga)
+    let chartRef = null;
+    // ===========================
+    // Utilidades
+    // ===========================
+    function findTagValue(obj, tag) {
+      if (obj == null || typeof obj !== "object") return undefined;
+      if (obj[tag] && typeof obj[tag] === "object" && "Value" in obj[tag]) return obj[tag].Value;
+      for (const k of Object.keys(obj)) {
+        const child = obj[k];
+        if (child && typeof child === "object") {
+          const v = findTagValue(child, tag);
+          if (v !== undefined) return v;
+        }
+      }
+      return undefined;
+    }
+
+    function toNumberLoose(v, { integersOnly = false } = {}) {
+      if (v == null) return NaN;
+      let s = String(v).trim();
+      if (!integersOnly) s = s.replace(",", ".");
+      if (integersOnly) {
+        s = s.replace(/[^\d]/g, "");
+        return s ? Number(s) : NaN;
+      } else {
+        let seenDot = false, out = "";
+        for (const ch of s) {
+          if (/\d/.test(ch)) out += ch;
+          else if (ch === "." && !seenDot) { out += ch; seenDot = true; }
+        }
+        return out ? Number(out) : NaN;
+      }
+    }
+
+    // Devuelve {y, m, d, key} desde 0008,0020 soportando "YYYYMMDD" o "YYYY-MM-DD"
+    function parseStudyDateToKey(v) {
+      if (v == null) return { y: NaN, m: NaN, d: NaN, key: NaN };
+      const digits = String(v).replace(/\D/g, "");
+      if (digits.length < 8) return { y: NaN, m: NaN, d: NaN, key: NaN };
+      const y = Number(digits.slice(0,4));
+      const m = Number(digits.slice(4,6));
+      const d = Number(digits.slice(6,8));
+      return { y, m, d, key: y*10000 + m*100 + d };
+    }
+
+    async function fetchPacientes() {
+      const res = await fetch(API_URL);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      return Array.isArray(json?.pacientes) ? json.pacientes : [];
+    }
+
+    // ===========================
+    // Transformación de datos
+    // ===========================
+    // Construye dos arreglos de puntos:
+    //  - beforePts: estudios con fecha < 2025-03
+    //  - afterPts:  estudios con fecha >= 2025-03
+    function buildColoredPoints(pacientes) {
+      const beforePts = [];
+      const afterPts = [];
+
+      for (const p of pacientes) {
+        const dateRaw = findTagValue(p, "0008,0020");      // StudyDate
+        const { key } = parseStudyDateToKey(dateRaw);
+        if (!Number.isFinite(key)) continue;
+
+        const weightRaw = findTagValue(p, "0010,1030");    // kg
+        const doseRaw   = findTagValue(p, "0018,1074");    // Bq
+
+        const weightKg  = toNumberLoose(weightRaw);
+        const doseBq    = toNumberLoose(doseRaw, { integersOnly: true });
+
+        if (!Number.isFinite(weightKg) || weightKg <= 0) continue;
+        if (!Number.isFinite(doseBq) || doseBq <= 0) continue;
+
+        const dose_mCi = doseBq / 3.7e7;                   // Bq -> mCi
+        const point = { x: weightKg, y: dose_mCi };
+
+        if (key < CUTOFF_KEY) beforePts.push(point);
+        else afterPts.push(point);
+      }
+
+      // Ordenamos por X (peso) para una lectura más limpia (no afecta puntos)
+      beforePts.sort((a,b) => a.x - b.x);
+      afterPts.sort((a,b) => a.x - b.x);
+
+      return { beforePts, afterPts };
+    }
+
+    // ===========================
+    // Gráfico único con dos colores
+    // ===========================
+    function makeScatter(canvasId, beforePts, afterPts) {
+      const ctx = document.getElementById(canvasId).getContext("2d");
+      return new Chart(ctx, {
+        type: "scatter",
+        data: {
+          datasets: [
+            {
+              label: "Antes de marzo 2025",
+              data: beforePts,
+              showLine: false,
+              pointRadius: 3,
+              pointHoverRadius: 5,
+              // Colores del grupo 1
+              backgroundColor: "rgba(25, 118, 210, 0.6)", // azul
+              borderColor: "rgba(25, 118, 210, 1)"
+            },
+            {
+              label: "Desde marzo 2025 en adelante",
+              data: afterPts,
+              showLine: false,
+              pointRadius: 3,
+              pointHoverRadius: 5,
+              // Colores del grupo 2
+              backgroundColor: "rgba(220, 95, 0, 0.6)",   // naranja
+              borderColor: "rgba(220, 95, 0, 1)"
+            }
+          ]
+        },
+        options: {
+          parsing: false,
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            x: { type: "linear", title: { display: true, text: "Peso [kg]" } },
+            y: {
+              title: { display: true, text: "Actividad inyectada [mCi]" },
+              min: 0,
+              max: 20   // Ajustá si querés otro techo
+            }
+          },
+          plugins: {
+            legend: { display: true, position: "top" },
+            tooltip: {
+              callbacks: {
+                label: (ctx) =>
+                  `Peso: ${ctx.parsed.x.toFixed(1)} kg • Actividad: ${ctx.parsed.y.toFixed(2)} mCi`
+              }
+            },
+            title: {
+              display: true,
+              text: "Actividad (mCi) vs Peso (kg) — Corte temporal en Marzo 2025"
+            }
+          }
+        }
+      });
+    }
+    // ===========================
+    // Orquestación
+    // ===========================
+    (async () => {
+      const statusEl = document.getElementById("status");
+      const statsA = document.getElementById("stats-a");
+      const statsB = document.getElementById("stats-b");
+
+      try {
+        const pacientes = await fetchPacientes();
+        const { beforePts, afterPts } = buildColoredPoints(pacientes);
+
+        // Guardamos la referencia global para el botón
+        chartRef = makeScatter("chart-all", beforePts, afterPts)
+
+        statsA.textContent = `Antes de Marzo/2025: N = ${beforePts.length} puntos válidos.`;
+        statsB.textContent = `Desde Marzo/2025: N = ${afterPts.length} puntos válidos.`;
+        statusEl.textContent = "Listo.";
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = "Error cargando datos: " + err.message;
+      }
+    })();
+  </script>
+  <script>
+    // Descargar PNG
+    document.getElementById('btnPNG').addEventListener('click', () => {
+      if (!chartRef) return; // por si aún no cargó
+      const link = document.createElement('a');
+      link.download = 'actividad_vs_peso.png';
+      link.href = chartRef.toBase64Image('image/png', 1);
+      link.click();
+    });
+  </script>
+</body>
+</html>
+

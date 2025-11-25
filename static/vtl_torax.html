@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>VTL - Protocolo Tórax</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="Description" content="Valor tipico local de CTDIvol y DLP de las TC hibridas. Tomografía de tórax en apnea inspiratoria (incluido por defecto en los protocolos 10.1 y 10.2)" />
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    body { margin: 20px; }
+    .wrap { max-width: 1300px; margin: 0 auto; }
+    h1 { margin: 0 0 6px; font-size: 1.35rem; }
+    #status { margin: 6px 0 14px; opacity:.9 }
+    .toolbar { display:flex; gap:8px; margin: 12px 0 16px; }
+    .toolbar button { padding:8px 12px; border:1px solid #ddd; border-radius:8px; cursor:pointer; background:#f7f7f7; }
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    thead th { position: sticky; top: 0; background: #fff; border-bottom: 2px solid #ddd; padding: 10px 8px; text-align: left; font-size: .9rem; }
+    thead th.num, tbody td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    tbody td { border-bottom: 1px solid #eee; padding: 8px; font-size: .92rem; word-wrap: break-word; }
+    tbody tr:nth-child(odd){ background: #fafafa; }
+    tfoot td { border-top: 2px solid #ddd; padding: 10px 8px; font-weight: 600; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:18px; margin: 14px 0 18px; }
+    .card { border:1px solid #e8e8e8; border-radius:12px; padding:12px; background:#fff; }
+    .card h2 { margin:0 0 6px; font-size:1rem; opacity:.85 }
+    .btn-dl { margin-top:8px; padding:8px 12px; border:1px solid #ddd; border-radius:8px; cursor:pointer; background:#f7f7f7; }
+    @media print {
+      .btn-dl { display:none !important; }
+      body { margin: 0; }
+      thead { display: table-header-group; }
+      tfoot { display: table-row-group; }
+      tr, td, th { break-inside: avoid; page-break-inside: avoid; }
+    }
+    @page { size: A4 portrait; margin: 12mm; }
+  </style>
+</head>
+<body>
+  <div class="wrap" id="export-root">
+    <h1>VTL - Protocolo Tórax</h1>
+    <div id="status">Cargando datos...</div>
+
+    <div class="toolbar">
+      <button id="btn-print" type="button">Guardar como PDF</button>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Histograma CTDIvol (mGy)</h2>
+        <div id="hist-ctdi"></div>
+      </div>
+      <div class="card">
+        <h2>Histograma DLP (mGy·cm)</h2>
+        <div id="hist-dlp"></div>
+      </div>
+    </div>
+
+    <table id="tabla">
+      <thead>
+        <tr>
+          <th>Paciente</th>
+          <th>Fecha</th><!-- NUEVO -->
+          <th class="num">Peso (kg)</th>
+          <th class="num">CTDIvol (mGy)</th>
+          <th class="num">DLP (mGy·cm)</th>
+          <th>Rgo escaneo (mm)</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <script>
+    Plotly.setPlotConfig({ displayModeBar: false, displaylogo: false });
+
+    const isEmpty = v => v === undefined || v === null || v === "";
+    const normalizeName = s => (s ? s.replace(/[\s^]+/g, " ").trim().toUpperCase() : "");
+    const escapeHtml = v => String(v ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;");
+    const normText = s => (s ? s.toString().normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase() : "");
+
+    // --- Fechas DICOM ---
+    function dicomDateToYMD(s){ if(!s||typeof s!=="string"||s.length<8) return null; return {y:+s.slice(0,4), m:+s.slice(4,6), d:+s.slice(6,8)};}
+    function dicomTimeToHMS(s){ if(!s||typeof s!=="string"||s.length<2) return {H:0,M:0,S:0}; const H=+s.slice(0,2)||0, M=+s.slice(2,4)||0, S=+s.slice(4,6)||0; return {H,M,S}; }
+    function makeTs(dateStr, timeStr){
+      const d = dicomDateToYMD(dateStr); if(!d) return null;
+      const t = dicomTimeToHMS(timeStr||"");
+      return new Date(d.y, d.m-1, d.d, t.H, t.M, t.S).getTime();
+    }
+    function fmtDate(ts){
+      if(!Number.isFinite(ts)) return "";
+      const d = new Date(ts); const mm = String(d.getMonth()+1).padStart(2,"0"); const dd = String(d.getDate()).padStart(2,"0");
+      return `${d.getFullYear()}-${mm}-${dd}`;
+    }
+
+    function toNumber(v) {
+      if (typeof v === "number" && Number.isFinite(v)) return v;
+      if (v === null || v === undefined) return null;
+      const str = String(v).trim();
+      if (str === "" || str === "-") return null;
+      let s = str.replace(/[^\d,.\-]/g, "");
+      if (s.includes(",") && !s.includes(".")) s = s.replace(",", ".");
+      else if (s.includes(",") && s.includes(".")) s = s.replace(/,/g, "");
+      const n = parseFloat(s);
+      return Number.isFinite(n) ? n : null;
+    }
+    const fmt = (n, dec = 2) => (n === null || n === undefined || !Number.isFinite(n) ? "" : n.toFixed(dec));
+    const fmtInt = n => (Number.isFinite(n) ? String(Math.round(n)) : "");
+    const isScout = typeStr => /scout|localizer|topogram|survey/i.test(typeStr || "");
+    const pick = (obj, keys, def=null) => { for (const k of keys) if (obj && obj[k] != null && obj[k] !== "") return obj[k]; return def; };
+    function unwrapTagValue(raw) {
+      if (raw === null || raw === undefined) return null;
+      if (Array.isArray(raw)) { for (const it of raw) if (!isEmpty(it)) return it; return null; }
+      if (typeof raw === "object") {
+        if ("Value" in raw) return unwrapTagValue(raw.Value);
+        if ("value" in raw) return unwrapTagValue(raw.value);
+      }
+      return raw;
+    }
+    function getTagFlexible(obj, tag, friendlyKeys = []) {
+      if (!obj) return null;
+      const keys = [tag, tag.toLowerCase(), tag.toUpperCase()];
+      for (const key of keys) if (Object.prototype.hasOwnProperty.call(obj, key)) {
+        const val = unwrapTagValue(obj[key]); if (!isEmpty(val)) return val;
+      }
+      const nests = [obj.dicom_tags, obj.tags, obj.attributes];
+      for (const nested of nests) {
+        if (!nested) continue;
+        for (const key of keys) if (Object.prototype.hasOwnProperty.call(nested, key)) {
+          const val = unwrapTagValue(nested[key]); if (!isEmpty(val)) return val;
+        }
+      }
+      for (const fk of friendlyKeys) {
+        const variants = [fk, fk.toLowerCase(), fk.toUpperCase()];
+        for (const v of variants) if (Object.prototype.hasOwnProperty.call(obj, v)) {
+          const val = unwrapTagValue(obj[v]); if (!isEmpty(val)) return val;
+        }
+      }
+      return null;
+    }
+
+    const median = arr => {
+      const a = arr.filter(Number.isFinite).slice().sort((x,y)=>x-y);
+      if (a.length === 0) return null;
+      const mid = Math.floor(a.length/2);
+      return (a.length % 2) ? a[mid] : (a[mid-1] + a[mid]) / 2;
+    };
+    function quantile(sorted, p) {
+      if (!sorted.length) return null;
+      const pos = (sorted.length - 1) * p;
+      const lo = Math.floor(pos), hi = Math.ceil(pos);
+      if (lo === hi) return sorted[lo];
+      return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+    }
+    function niceStep(step) {
+      if (!Number.isFinite(step) || step <= 0) return null;
+      const pow = Math.pow(10, Math.floor(Math.log10(step)));
+      const norm = step / pow;
+      const nice = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+      return nice * pow;
+    }
+    function xbinsFromFD(arr) {
+      const data = arr.filter(Number.isFinite).slice().sort((a,b)=>a-b);
+      if (data.length < 2) return null;
+      const q1 = quantile(data, 0.25);
+      const q3 = quantile(data, 0.75);
+      const iqr = q3 - q1;
+      const fdw = (2 * iqr) / Math.cbrt(data.length);
+      const step = niceStep(fdw) || niceStep((Math.max(...data)-Math.min(...data))/12) || 1;
+      const min = Math.min(...data), max = Math.max(...data);
+      const start = Math.floor(min / step) * step;
+      const end   = Math.ceil (max / step) * step;
+      return { start, end, size: step };
+    }
+
+    async function loadAll() {
+      const status = document.getElementById("status");
+      try {
+        const [ocrRes, ctRes] = await Promise.all([ fetch("/ocr"), fetch("/ct") ]);
+        if (!ocrRes.ok) throw new Error("Error al obtener /ocr");
+        if (!ctRes.ok) throw new Error("Error al obtener /ct");
+
+        const ocrJson = await ocrRes.json();
+        const ctJson  = await ctRes.json();
+
+        const ocrRows = parseOCR(ocrJson);
+        const { ctBySOP, ctByNameSerie } = indexCT(ctJson);
+
+        const merged = [];
+        const seen = new Set();
+
+        for (const o of ocrRows) {
+          const dedupKey = o.sopInstanceUID
+            ? `SOP:${o.sopInstanceUID}`
+            : `${normalizeName(o.patientName)}|${o.seriesNumber ?? ""}|${o.scanRangeMM ?? ""}`;
+          if (seen.has(dedupKey)) continue;
+
+          let ct = null;
+          if (o.sopInstanceUID) ct = ctBySOP.get(o.sopInstanceUID) || null;
+          if (!ct) ct = ctByNameSerie.get(`${normalizeName(o.patientName)}|${o.seriesNumber ?? ""}`) || null;
+
+          merged.push({
+            patientName: ct?.patientName || o.patientName || "",
+            patientWeightKg: ct?.patientWeightKg ?? null,
+            seriesNumber: o.seriesNumber,
+            seriesDescription: ct?.seriesDescription || "",
+            ctdiVol: o.ctdiVol,
+            dlp: o.dlp,
+            scanRangeMM: o.scanRangeMM || "",
+            studyTs: ct?.studyTs ?? null,          // NUEVO
+            studyDateStr: ct?.studyDateStr ?? ""   // NUEVO
+          });
+
+          seen.add(dedupKey);
+        }
+
+        // Filtro: Tórax + 60–80 kg + CTDIvol válido
+        const filtered = merged.filter(r => {
+          const desc = normText(r.seriesDescription);
+          const w = r.patientWeightKg;
+          return desc.includes("TORAX") && Number.isFinite(w) && w >= 60 && w <= 80 && Number.isFinite(r.ctdiVol);
+        })
+        // Orden: más nuevo → más antiguo
+        .sort((a, b) => {
+          const ta = Number.isFinite(a.studyTs) ? a.studyTs : -Infinity;
+          const tb = Number.isFinite(b.studyTs) ? b.studyTs : -Infinity;
+          if (tb !== ta) return tb - ta;
+          const an = normalizeName(a.patientName), bn = normalizeName(b.patientName);
+          if (an < bn) return -1;
+          if (an > bn) return 1;
+          return (a.seriesNumber ?? 0) - (b.seriesNumber ?? 0);
+        });
+
+        renderRows(filtered);
+
+        const ctdiVals = filtered.map(r => r.ctdiVol).filter(Number.isFinite);
+        const dlpVals  = filtered.map(r => r.dlp).filter(Number.isFinite);
+
+        const medCTDI = median(ctdiVals);
+        const medDLP  = median(dlpVals);
+
+        const sCTDI = ctdiVals.slice().sort((a,b)=>a-b);
+        const sDLP  = dlpVals.slice().sort((a,b)=>a-b);
+        const p25CTDI = quantile(sCTDI, 0.25);
+        const p75CTDI = quantile(sCTDI, 0.75);
+        const p25DLP  = quantile(sDLP,  0.25);
+        const p75DLP  = quantile(sDLP,  0.75);
+
+
+        drawHist("hist-ctdi", ctdiVals, "CTDIvol", "mGy", 2);
+        drawHist("hist-dlp",  dlpVals,  "DLP", "mGy·cm", 1);
+
+        status.textContent = `Ok. ${filtered.length} series (Tórax, 60–80 kg). Orden: más nuevo → más antiguo.`;
+      } catch (err) {
+        console.error(err);
+        status.textContent = "Error cargando datos: " + err.message;
+      }
+    }
+
+    function parseOCR(data) {
+      const out = [];
+      const docs = Array.isArray(data?.pacientes) ? data.pacientes : [];
+      for (const doc of docs) {
+        const header = doc?.encabezado || {};
+        const rawName = header["Patient Name"] ?? header["patient_name"] ?? doc?.patient?.patient_name ?? doc?.patient_name ?? "";
+        const patientName = rawName ? String(rawName).trim() : "";
+        const seriesList = Array.isArray(doc?.series) ? doc.series : [];
+        for (const serie of seriesList) {
+          const typeRaw = pick(serie, ["Type","type","SerieType","serie_type"], "");
+          if (isScout(typeRaw)) continue;
+          const seriesNumberRaw = pick(serie, ["series_number","Serie","serie","SeriesNumber","Series"], null);
+          const seriesNumber = toNumber(seriesNumberRaw);
+          const ctdiVol = toNumber(pick(serie, ["ctdivol","CTDIvol","CTDIvol(mGy)","ctdi_vol"]));
+          const dlp = toNumber(pick(serie, ["dlp","DLP"]));
+          const scanRange = pick(serie, ["scan_range_mm","ScanRange","Scan Range","scan_range","scanRange"], "");
+          const sopInstanceUID = pick(serie, ["sop_instance_uid","SOPInstanceUID","sop","SOP"], "");
+          out.push({
+            patientName,
+            seriesNumber: Number.isFinite(seriesNumber) ? seriesNumber : null,
+            sopInstanceUID: sopInstanceUID || "",
+            ctdiVol,
+            dlp,
+            scanRangeMM: scanRange || ""
+          });
+        }
+      }
+      return out;
+    }
+
+    function indexCT(data) {
+      const docs = Array.isArray(data?.pacientes) ? data.pacientes :
+                   Array.isArray(data?.series) ? data.series :
+                   Array.isArray(data) ? data : [];
+      const bySOP = new Map();
+      const byNameSerie = new Map();
+
+      for (const doc of docs) {
+        const sources = [
+          doc, doc?.dicom_tags, doc?.first_instance, doc?.first_instance?.dicom_tags,
+          doc?.metadata, doc?.metadata?.dicom_tags, doc?.series, doc?.series?.dicom_tags, doc?.patient, doc?.patient?.dicom_tags
+        ];
+        const extract = (tag, friendly = []) => {
+          for (const src of sources) {
+            const val = getTagFlexible(src, tag, friendly);
+            if (!isEmpty(val)) return val;
+          }
+          return null;
+        };
+
+        const sopInstanceUID   = extract("0008,0018", ["SOPInstanceUID","SOPInstanceUid","sop_instance_uid","SeriesInstanceUID","series_instance_uid"]);
+        const seriesNumberCand = toNumber(extract("0020,0011", ["SeriesNumber","series_number"]));
+        const seriesNumber     = Number.isFinite(seriesNumberCand) ? seriesNumberCand : toNumber(doc?.series?.series_number);
+        const patientNameRaw   = extract("0010,0010", ["PatientName","patient_name"]) || doc?.patient?.patient_name || "";
+        const weightKg         = toNumber(extract("0010,1030", ["PatientWeight","patient_weight"]));
+        const patientWeightKg  = Number.isFinite(weightKg) ? Math.round(weightKg) : null;
+        const seriesDescription= extract("0008,103E", ["SeriesDescription","series_description"]);
+
+        // ---- fechas preferidas ----
+        const sDate = extract("0008,0021", ["SeriesDate"]);
+        const sTime = extract("0008,0031", ["SeriesTime"]);
+        const stDate= extract("0008,0020", ["StudyDate"]);
+        const stTime= extract("0008,0030", ["StudyTime"]);
+        const cDate = extract("0008,0023", ["ContentDate"]);
+        const cTime = extract("0008,0033", ["ContentTime"]);
+
+        let ts = makeTs(sDate, sTime);
+        if (!Number.isFinite(ts)) ts = makeTs(stDate, stTime);
+        if (!Number.isFinite(ts)) ts = makeTs(cDate, cTime);
+        const dateStr = fmtDate(ts);
+
+        const ctInfo = {
+          sopInstanceUID: sopInstanceUID || "",
+          seriesNumber: Number.isFinite(seriesNumber) ? seriesNumber : null,
+          patientName: patientNameRaw || "",
+          patientWeightKg,
+          seriesDescription: seriesDescription || "",
+          studyTs: Number.isFinite(ts) ? ts : null,     // NUEVO
+          studyDateStr: dateStr || ""                   // NUEVO
+        };
+
+        if (ctInfo.sopInstanceUID) bySOP.set(ctInfo.sopInstanceUID, ctInfo);
+        if (ctInfo.patientName && Number.isFinite(ctInfo.seriesNumber)) {
+          const key = `${normalizeName(ctInfo.patientName)}|${ctInfo.seriesNumber}`;
+          if (!byNameSerie.has(key)) byNameSerie.set(key, ctInfo);
+        }
+      }
+      return { ctBySOP: bySOP, ctByNameSerie: byNameSerie };
+    }
+
+    function renderRows(rows) {
+      const tbody = document.querySelector("#tabla tbody");
+      tbody.innerHTML = "";
+      if (!rows.length) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td colspan="6" class="num">Sin resultados</td>`;
+        tbody.appendChild(tr);
+        return;
+      }
+      for (const r of rows) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${escapeHtml(r.patientName)}</td>
+          <td>${escapeHtml(r.studyDateStr || "")}</td>
+          <td class="num">${fmtInt(r.patientWeightKg)}</td>
+          <td class="num">${fmt(r.ctdiVol)}</td>
+          <td class="num">${fmt(r.dlp)}</td>
+          <td>${escapeHtml(r.scanRangeMM || "")}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    // ===== Histograma con Mediana (rojo), P25 (azul) y P75 (verde) =====
+    function drawHist(id, data, title, units, decimals=2) {
+      const div = document.getElementById(id);
+      if (!data.length) { div.innerHTML = '<div class="muted">Sin datos.</div>'; return; }
+
+      div.innerHTML = `
+        <div id="${id}-plot"></div>
+        <button id="btn-${id}" class="btn-dl">Descargar PNG</button>
+      `;
+
+      const med = median(data);
+      const sorted = data.slice().sort((a,b)=>a-b);
+      const q1 = quantile(sorted, 0.25);
+      const q3 = quantile(sorted, 0.75);
+
+      const xbins = xbinsFromFD(data);
+      const start = xbins?.start ?? Math.min(...data);
+      const end   = xbins?.end   ?? Math.max(...data);
+      const h     = (xbins ? xbins.size / 4 : (end - start) / 20);
+
+      const trace = {
+        type: "histogram",
+        x: data,
+        autobinx: false,
+        xbins: { start, end, size: h },
+        marker: { color: "rgba(96,165,250,0.35)", line: { width: 0 } },
+        opacity: 1.0,
+        hovertemplate: `${title}: %{x:.${decimals}f} ${units}<br>n = %{y}<extra></extra>`,
+        name: ""
+      };
+
+      const shapes = [];
+      const annotations = [];
+
+      if (med != null) {
+        shapes.push({ type: "line", x0: med, x1: med, xref: "x", y0: 0, y1: 1, yref: "paper",
+                      line: { width: 1.5, dash: "dash", color: "red" } });
+        annotations.push({ x: med, y: 1, yref: "paper", xanchor: "left", showarrow: false,
+                           text: `Mediana: ${med.toFixed(decimals)}`, font: { size: 12, color: "red" } });
+      }
+      if (q1 != null) {
+        shapes.push({ type: "line", x0: q1, x1: q1, xref: "x", y0: 0, y1: 1, yref: "paper",
+                      line: { width: 1, dash: "dot", color: "#1f77b4" } });
+        annotations.push({ x: q1, y: 0.90, yref: "paper", xanchor: "right", showarrow: false,
+                           text: `P25: ${q1.toFixed(decimals)}`, font: { size: 11, color: "#1f77b4" } });
+      }
+      if (q3 != null) {
+        shapes.push({ type: "line", x0: q3, x1: q3, xref: "x", y0: 0, y1: 1, yref: "paper",
+                      line: { width: 1, dash: "dot", color: "#2ca02c" } });
+        annotations.push({ x: q3, y: 0.90, yref: "paper", xanchor: "left", showarrow: false,
+                           text: `P75: ${q3.toFixed(decimals)}`, font: { size: 11, color: "#2ca02c" } });
+      }
+
+      const layout = {
+        margin: { t: 10, r: 20, b: 70, l: 70 },
+        height: 320,
+        bargap: 0,
+        xaxis: {
+          title: `${title} (${units})`,
+          standoff: 12,
+          tickformat: ".2f",
+          showgrid: true,
+          gridwidth: 1,
+          zeroline: true,
+          ticks: "outside"
+        },
+        yaxis: { title: "Frecuencia", rangemode: "tozero" },
+        shapes,
+        annotations
+      };
+
+      Plotly.newPlot(`${id}-plot`, [trace], layout, { displayModeBar: false, displaylogo: false, responsive: true });
+
+      document.getElementById(`btn-${id}`).addEventListener("click", () => {
+        Plotly.downloadImage(`${id}-plot`, { format: "png", filename: `${id}_histograma` });
+      });
+    }
+
+    document.getElementById("btn-print").addEventListener("click", ()=>window.print());
+    loadAll();
+  </script>
+</body>
+</html>

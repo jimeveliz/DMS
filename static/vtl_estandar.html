@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>VTL - Protocolo 10.1</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="Description" content="Valor tipico local de CTDIvol y DLP de las TC hibridas. Protocolo PET/CT FDG + Tórax (Desde calota hasta tercio superior del muslo)" />
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    body { margin: 20px; }
+    .wrap { max-width: 1300px; margin: 0 auto; }
+    h1 { margin: 0 0 6px; font-size: 1.35rem; }
+    #status { margin: 6px 0 14px; opacity:.9 }
+    .toolbar { display:flex; gap:8px; margin: 12px 0 16px; }
+    .toolbar button { padding:8px 12px; border:1px solid #ddd; border-radius:8px; cursor:pointer; background:#f7f7f7; }
+
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    thead th {
+      position: sticky; top: 0; background: #fff;
+      border-bottom: 2px solid #ddd; padding: 10px 8px; text-align: left; font-size: .9rem;
+    }
+    tbody td { border-bottom: 1px solid #eee; padding: 8px; font-size: .92rem; word-wrap: break-word; }
+    tbody tr:nth-child(odd){ background: #fafafa; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .muted { color:#777 }
+
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:18px; margin: 14px 0 18px; }
+    .card { border:1px solid #e8e8e8; border-radius:12px; padding:12px; }
+    .card h2 { margin:0 0 6px; font-size:1rem; opacity:.85 }
+
+    @media print {
+      .toolbar, #status { display:none !important; }
+      thead { display: table-header-group; } tfoot { display: table-row-group; }
+      tr, td, th { break-inside: avoid; page-break-inside: avoid; }
+    }
+    @page { size: A4 landscape; margin: 12mm; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>VTL - Protocolo 10.1</h1>
+    <div id="status" class="muted">Cargando…</div>
+
+    <div class="toolbar">
+      <button id="btn-print" type="button">Guardar como PDF</button>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Histograma CTDIvol (mGy)</h2>
+        <div id="hist-ctdi"></div>
+      </div>
+      <div class="card">
+        <h2>Histograma DLP (mGy·cm)</h2>
+        <div id="hist-dlp"></div>
+      </div>
+    </div>
+
+    <table id="tabla">
+      <thead>
+        <tr>
+          <th>Paciente</th>
+          <th>Fecha</th><!-- NUEVO -->
+          <th class="num">Peso (kg)</th>
+          <th> Protocolo </th>
+          <th class="num">CTDIvol (mGy)</th>
+          <th class="num">DLP (mGy·cm)</th>
+          <th>Rgo escaneo (mm)</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+<script>
+const isEmpty = v => v === undefined || v === null || v === "";
+const normalizeName = s => (s ? s.replace(/[\s^]+/g, " ").trim().toUpperCase() : "");
+const normalizeStr  = s => (s ? String(s).trim().toUpperCase() : "");
+
+// ---- Fechas DICOM -> timestamp ----
+function dicomDateToYMD(s){ if(!s||typeof s!=="string"||s.length<8) return null; return {y:+s.slice(0,4), m:+s.slice(4,6), d:+s.slice(6,8)};}
+function dicomTimeToHMS(s){ if(!s||typeof s!=="string"||s.length<2) return {H:0,M:0,S:0}; const H=+s.slice(0,2)||0, M=+s.slice(2,4)||0, S=+s.slice(4,6)||0; return {H,M,S}; }
+function makeTs(dateStr, timeStr){
+  const d = dicomDateToYMD(dateStr); if(!d) return null;
+  const t = dicomTimeToHMS(timeStr||"");
+  return new Date(d.y, d.m-1, d.d, t.H, t.M, t.S).getTime();
+}
+function fmtDate(ts){
+  if(!Number.isFinite(ts)) return "";
+  const d = new Date(ts); const mm = String(d.getMonth()+1).padStart(2,"0"); const dd = String(d.getDate()).padStart(2,"0");
+  return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
+function toNumber(v) {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (v === null || v === undefined) return null;
+  const str = String(v).trim();
+  if (str === "" || str === "-") return null;
+  let s = str.replace(/[^\d,.\-]/g, "");
+  if (s.includes(",") && !s.includes(".")) s = s.replace(",", ".");
+  else if (s.includes(",") && s.includes(".")) s = s.replace(/,/g, "");
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
+const fmt = (n, dec = 2) => (n === null || n === undefined || !Number.isFinite(n) ? "" : n.toFixed(dec));
+const isScout = typeStr => /scout|localizer|topogram|survey/i.test(typeStr || "");
+
+function pick(obj, keys, def = null) {
+  for (const k of keys) if (obj && obj[k] != null && obj[k] !== "") return obj[k];
+  return def;
+}
+function unwrapTagValue(raw) {
+  if (raw === null || raw === undefined) return null;
+  if (Array.isArray(raw)) { for (const it of raw) if (!isEmpty(it)) return it; return null; }
+  if (typeof raw === "object") {
+    if ("Value" in raw) return unwrapTagValue(raw.Value);
+    if ("value" in raw) return unwrapTagValue(raw.value);
+  }
+  return raw;
+}
+function getTagFlexible(obj, tag, friendlyKeys = []) {
+  if (!obj) return null;
+  const keys = [tag, tag.toLowerCase(), tag.toUpperCase()];
+  for (const key of keys) if (Object.prototype.hasOwnProperty.call(obj, key)) {
+    const val = unwrapTagValue(obj[key]); if (!isEmpty(val)) return val;
+  }
+  const nests = [obj.dicom_tags, obj.tags, obj.attributes];
+  for (const nested of nests) {
+    if (!nested) continue;
+    for (const key of keys) if (Object.prototype.hasOwnProperty.call(nested, key)) {
+      const val = unwrapTagValue(nested[key]); if (!isEmpty(val)) return val;
+    }
+  }
+  for (const fk of friendlyKeys) {
+    const variants = [fk, fk.toLowerCase(), fk.toUpperCase()];
+    for (const v of variants) if (Object.prototype.hasOwnProperty.call(obj, v)) {
+      const val = unwrapTagValue(obj[v]); if (!isEmpty(val)) return val;
+    }
+  }
+  return null;
+}
+
+// ---------- Estadística básica ----------
+function median(values) {
+  const arr = values.filter(Number.isFinite).sort((a,b)=>a-b);
+  if (!arr.length) return null;
+  const m = Math.floor(arr.length/2);
+  return arr.length % 2 ? arr[m] : (arr[m-1] + arr[m]) / 2;
+}
+function quantile(sorted, p) {
+  if (!sorted.length) return null;
+  const pos = (sorted.length - 1) * p;
+  const lo = Math.floor(pos), hi = Math.ceil(pos);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+function niceStep(step) {
+  if (!Number.isFinite(step) || step <= 0) return null;
+  const pow = Math.pow(10, Math.floor(Math.log10(step)));
+  const norm = step / pow;
+  let nice = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+  return nice * pow;
+}
+function xbinsFromFD(arr) {
+  const data = arr.filter(Number.isFinite).sort((a,b)=>a-b);
+  if (data.length < 2) return null;
+  const q1 = quantile(data, 0.25);
+  const q3 = quantile(data, 0.75);
+  const iqr = q3 - q1;
+  const fdw = (2 * iqr) / Math.cbrt(data.length);
+  const step = niceStep(fdw) || niceStep((Math.max(...data)-Math.min(...data))/12) || 1;
+  const min = Math.min(...data), max = Math.max(...data);
+  const start = Math.floor(min / step) * step;
+  const end   = Math.ceil (max / step) * step;
+  return { start, end, size: step };
+}
+
+// ---------- Carga y render ----------
+async function loadAll() {
+  const status = document.getElementById("status");
+  try {
+    const [ocrRes, ctRes] = await Promise.all([ fetch("/ocr"), fetch("/ct") ]);
+    if (!ocrRes.ok) throw new Error("Error al obtener /ocr");
+    if (!ctRes.ok) throw new Error("Error al obtener /ct");
+
+    const ocrJson = await ocrRes.json();
+    const ctJson  = await ctRes.json();
+
+    const ocrRows = parseOCR(ocrJson);
+    const { ctBySOP, ctByNameSerie } = indexCT(ctJson);
+
+    const merged = [];
+    const seen = new Set();
+
+    for (const o of ocrRows) {
+      const dedupKey = o.sopInstanceUID
+        ? `SOP:${o.sopInstanceUID}`
+        : `${normalizeName(o.patientName)}|${o.seriesNumber ?? ""}|${o.scanRangeMM ?? ""}`;
+      if (seen.has(dedupKey)) continue;
+
+      let ct = null;
+      if (o.sopInstanceUID) ct = ctBySOP.get(o.sopInstanceUID) || null;
+      if (!ct) ct = ctByNameSerie.get(`${normalizeName(o.patientName)}|${o.seriesNumber ?? ""}`) || null;
+
+      merged.push({
+        patientName: ct?.patientName || o.patientName || "",
+        patientWeightKg: ct?.patientWeightKg ?? null,
+        seriesNumber: o.seriesNumber,
+        seriesDescription: ct?.seriesDescription || "",
+        protocolName: ct?.protocolName || "",
+        ctdiVol: o.ctdiVol,
+        dlp: o.dlp,
+        scanRangeMM: o.scanRangeMM || "",
+        studyTs: ct?.studyTs ?? null,           // NUEVO
+        studyDateStr: ct?.studyDateStr ?? ""    // NUEVO
+      });
+      seen.add(dedupKey);
+    }
+
+    // ===== Filtro: ProtocolName = "10.1 PET/CT FDG + TORAX" y peso 60–80 kg =====
+    const TARGET_PROTOCOL = "10.1 PET/CT FDG + TORAX";
+
+    const filtered = merged.filter(r => {
+      const sd = normalizeStr(r.seriesDescription);
+      const pn = normalizeStr(r.protocolName);
+      const w  = r.patientWeightKg;
+      return (
+        sd.includes("CTAC") &&
+        pn === "10.1 PET/CT FDG + TORAX" &&
+        Number.isFinite(w) && w >= 60 && w <= 80
+      );
+    })
+    // ORDEN: más nuevo → más antiguo
+    .sort((a,b)=>{
+      const ta = Number.isFinite(a.studyTs) ? a.studyTs : -Infinity;
+      const tb = Number.isFinite(b.studyTs) ? b.studyTs : -Infinity;
+      if (tb !== ta) return tb - ta;
+      const an = normalizeName(a.patientName), bn = normalizeName(b.patientName);
+      if (an < bn) return -1; if (an > bn) return 1;
+      return (a.seriesNumber ?? 0) - (b.seriesNumber ?? 0);
+    });
+
+    renderTable(filtered);
+    renderHistos(filtered);
+
+    status.textContent = `Ok. ${filtered.length} series. Protocolo: ${TARGET_PROTOCOL}. Pacientes estandar: peso 60–80 kg. (ordenado: más nuevo → más antiguo)`;
+  } catch (err) {
+    console.error(err);
+    document.getElementById("status").textContent = "Error cargando datos: " + err.message;
+  }
+}
+
+function parseOCR(data) {
+  const out = [];
+  const docs = Array.isArray(data?.pacientes) ? data.pacientes : [];
+  for (const doc of docs) {
+    const header = doc?.encabezado || {};
+    const rawName = header["Patient Name"] ?? header["patient_name"] ?? doc?.patient?.patient_name ?? doc?.patient_name ?? "";
+    const patientName = rawName ? String(rawName).trim() : "";
+    const seriesList = Array.isArray(doc?.series) ? doc.series : [];
+    for (const serie of seriesList) {
+      const typeRaw = pick(serie, ["Type","type","SerieType","serie_type"], "");
+      if (isScout(typeRaw)) continue;
+      const seriesNumberRaw = pick(serie, ["series_number","Serie","serie","SeriesNumber","Series"], null);
+      const seriesNumber = toNumber(seriesNumberRaw);
+      const ctdiVol = toNumber(pick(serie, ["ctdivol","CTDIvol","CTDIvol(mGy)","ctdi_vol"]));
+      const dlp = toNumber(pick(serie, ["dlp","DLP"]));
+      const scanRange = pick(serie, ["scan_range_mm","ScanRange","Scan Range","scan_range","scanRange"], "");
+      const sopInstanceUID = pick(serie, ["sop_instance_uid","SOPInstanceUID","sop","SOP"], "");
+      out.push({
+        patientName,
+        seriesNumber: Number.isFinite(seriesNumber) ? seriesNumber : null,
+        sopInstanceUID: sopInstanceUID || "",
+        ctdiVol,
+        dlp,
+        scanRangeMM: scanRange || ""
+      });
+    }
+  }
+  return out;
+}
+
+function indexCT(data) {
+  const docs = Array.isArray(data?.pacientes) ? data.pacientes :
+               Array.isArray(data?.series) ? data.series :
+               Array.isArray(data) ? data : [];
+  const bySOP = new Map();
+  const byNameSerie = new Map();
+
+  for (const doc of docs) {
+    const sources = [
+      doc, doc?.dicom_tags, doc?.first_instance, doc?.first_instance?.dicom_tags,
+      doc?.metadata, doc?.metadata?.dicom_tags, doc?.series, doc?.series?.dicom_tags,
+      doc?.patient, doc?.patient?.dicom_tags
+    ];
+    const extract = (tag, friendly = []) => {
+      for (const src of sources) {
+        const val = getTagFlexible(src, tag, friendly);
+        if (!isEmpty(val)) return val;
+      }
+      return null;
+    };
+
+    const sopInstanceUID   = extract("0008,0018", ["SOPInstanceUID","SOPInstanceUid","sop_instance_uid","SeriesInstanceUID","series_instance_uid"]);
+    const seriesNumberCand = toNumber(extract("0020,0011", ["SeriesNumber","series_number"]));
+    const seriesNumber     = Number.isFinite(seriesNumberCand) ? seriesNumberCand : toNumber(doc?.series?.series_number);
+    const patientNameRaw   = extract("0010,0010", ["PatientName","patient_name"]) || doc?.patient?.patient_name || "";
+    const weightKgRaw      = toNumber(extract("0010,1030", ["PatientWeight","patient_weight"]));
+    const patientWeightKg  = Number.isFinite(weightKgRaw) ? weightKgRaw : null;
+    const seriesDescription= extract("0008,103E", ["SeriesDescription","series_description"]);
+    const protocolName     = extract("0018,1030", ["ProtocolName","Protocol Name","protocol_name","Protocol"]);
+
+    // Fechas preferidas
+    const sDate = extract("0008,0021", ["SeriesDate"]);
+    const sTime = extract("0008,0031", ["SeriesTime"]);
+    const stDate= extract("0008,0020", ["StudyDate"]);
+    const stTime= extract("0008,0030", ["StudyTime"]);
+    const cDate = extract("0008,0023", ["ContentDate"]);
+    const cTime = extract("0008,0033", ["ContentTime"]);
+
+    let ts = makeTs(sDate, sTime);
+    if (!Number.isFinite(ts)) ts = makeTs(stDate, stTime);
+    if (!Number.isFinite(ts)) ts = makeTs(cDate, cTime);
+    const dateStr = fmtDate(ts);
+
+    const ctInfo = {
+      sopInstanceUID: sopInstanceUID || "",
+      seriesNumber: Number.isFinite(seriesNumber) ? seriesNumber : null,
+      patientName: patientNameRaw || "",
+      patientWeightKg,
+      seriesDescription: seriesDescription || "",
+      protocolName: protocolName || "",
+      studyTs: Number.isFinite(ts) ? ts : null,      // NUEVO
+      studyDateStr: dateStr || ""                    // NUEVO
+    };
+
+    if (ctInfo.sopInstanceUID) bySOP.set(ctInfo.sopInstanceUID, ctInfo);
+    if (ctInfo.patientName && Number.isFinite(ctInfo.seriesNumber)) {
+      const key = `${normalizeName(ctInfo.patientName)}|${ctInfo.seriesNumber}`;
+      if (!byNameSerie.has(key)) byNameSerie.set(key, ctInfo);
+    }
+  }
+  return { ctBySOP: bySOP, ctByNameSerie: byNameSerie };
+}
+
+function renderTable(rows) {
+  const tbody = document.querySelector("#tabla tbody");
+  tbody.innerHTML = "";
+  if (!rows.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="7" class="muted">Sin resultados para el protocolo objetivo con peso entre 60 y 80 kg.</td>`;
+    tbody.appendChild(tr);
+    return;
+  }
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(r.patientName)}</td>
+      <td>${escapeHtml(r.studyDateStr || "")}</td>
+      <td class="num">${fmt(r.patientWeightKg, 1)}</td>
+      <td>${escapeHtml(r.protocolName || "")}</td>
+      <td class="num">${fmt(r.ctdiVol, 2)}</td>
+      <td class="num">${fmt(r.dlp)}</td>
+      <td>${escapeHtml(r.scanRangeMM || "")}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+function renderHistos(rows) {
+  const xCTDI = rows.map(r => r.ctdiVol).filter(Number.isFinite);
+  const xDLP  = rows.map(r => r.dlp).filter(Number.isFinite);
+
+  // ====== FUNCIÓN AUXILIAR PARA GRAFICAR ======
+  function drawHist(id, data, title, units, decimals=2) {
+    const div = document.getElementById(id);
+    if (!data.length) {
+      div.innerHTML = '<div class="muted">Sin datos.</div>';
+      return;
+    }
+
+    // Calcular mediana, P25 y P75
+    const med = median(data);
+    const sorted = data.slice().sort((a,b)=>a-b);
+    const q1 = quantile(sorted, 0.25);
+    const q3 = quantile(sorted, 0.75);
+
+    // Bins (reducción) basados en FD
+    const xbins = xbinsFromFD(data);
+    if (xbins) xbins.size = xbins.size / 4;
+
+    const start = xbins?.start ?? Math.min(...data);
+    const end   = xbins?.end ?? Math.max(...data);
+    const h     = xbins?.size ?? ((end - start) / 20);
+
+    // contenedor con botón
+    div.innerHTML = `
+      <div id="${id}-plot"></div>
+      <button id="btn-${id}" style="margin-top:6px;padding:6px 10px;border:1px solid #ccc;border-radius:6px;cursor:pointer;">
+        Descargar PNG
+      </button>
+    `;
+
+    // Líneas de referencia (mediana rojo, P25 azul, P75 verde)
+    const shapes = [];
+    const annotations = [];
+    if (med != null) {
+      shapes.push({
+        type: "line", x0: med, x1: med, xref: "x", y0: 0, y1: 1, yref: "paper",
+        line: { width: 1.5, dash: "dash", color: "red" }
+      });
+      annotations.push({
+        x: med, y: 1, yref: "paper", xanchor: "left", showarrow: false,
+        text: `Mediana: ${med.toFixed(decimals)}`, font: { size: 12, color: "red" }
+      });
+    }
+    if (q1 != null) {
+      shapes.push({
+        type: "line", x0: q1, x1: q1, xref: "x", y0: 0, y1: 1, yref: "paper",
+        line: { width: 1, dash: "dot", color: "#1f77b4" } // azul P25
+      });
+      annotations.push({
+        x: q1, y: 0.90, yref: "paper", xanchor: "right", showarrow: false,
+        text: `P25: ${q1.toFixed(decimals)}`, font: { size: 11, color: "#1f77b4" }
+      });
+    }
+    if (q3 != null) {
+      shapes.push({
+        type: "line", x0: q3, x1: q3, xref: "x", y0: 0, y1: 1, yref: "paper",
+        line: { width: 1, dash: "dot", color: "#2ca02c" } // verde P75
+      });
+      annotations.push({
+        x: q3, y: 0.90, yref: "paper", xanchor: "left", showarrow: false,
+        text: `P75: ${q3.toFixed(decimals)}`, font: { size: 11, color: "#2ca02c" }
+      });
+    }
+
+    // Crear histograma
+    Plotly.newPlot(`${id}-plot`, [{
+      type: "histogram",
+      x: data,
+      autobinx: false,
+      xbins: { start, end, size: h },
+      marker: { color: "rgba(96,165,250,0.35)", line: { width: 0 } },
+      opacity: 1.0,
+      hovertemplate: `${title}: %{x:.${decimals}f} ${units}<br>n = %{y}<extra></extra>`,
+      name: ""
+    }], {
+      margin: { t: 10, r: 20, b: 70, l: 70 },
+      height: 320,
+      bargap: 0,
+      xaxis: {
+        title: `${title} (${units})`,
+        standoff: 12,
+        tickformat: ".2f",
+        showgrid: true,
+        gridwidth: 1,
+        zeroline: true,
+        ticks: "outside"
+      },
+      yaxis: { title: "Frecuencia", rangemode: "tozero" },
+      shapes,
+      annotations
+    });
+
+    // Descargar PNG
+    document.getElementById(`btn-${id}`).addEventListener("click", () => {
+      Plotly.downloadImage(`${id}-plot`, {
+        format: "png",
+        filename: `${id}_histograma_estandar`,
+      });
+    });
+  }
+
+  // ====== LLAMADOS ======
+  drawHist("hist-ctdi", xCTDI, "CTDIvol", "mGy", 2);
+  drawHist("hist-dlp",  xDLP,  "DLP", "mGy·cm", 1);
+}
+
+Plotly.setPlotConfig({ displayModeBar: false, displaylogo: false });
+
+const escapeHtml = v => String(v ?? "")
+  .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+  .replaceAll('"',"&quot;").replaceAll("'","&#39;");
+
+document.getElementById("btn-print").addEventListener("click", ()=>window.print());
+
+loadAll();
+</script>
+</body>
+</html>

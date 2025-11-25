@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="Description" content="Variación de actividad inyectada en función del tiempo. Comportamiento de valores de GNI. Datos ordenados cronológicamente." />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <title>Actividad inyectada en relación con GNI</title>
+  <!-- Librerías -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
+  <style>
+    :root { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", "Liberation Sans", sans-serif; }
+    body { margin: 0; padding: 24px; background: #fafafa; color: #111; }
+    .wrap { max-width: 980px; margin: 0 auto; }
+    h1 { font-size: 1.4rem; margin: 0 0 12px; }
+    p.hint { margin: 6px 0 18px; color: #444; }
+    .card { background: #fff; border-radius: 14px; padding: 16px; box-shadow: 0 8px 30px rgba(0,0,0,.06); }
+    label, input { font-size: .95rem; }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    input[type="text"] { padding: 8px 10px; border: 1px solid #ddd; border-radius: 10px; width: 360px; }
+    button { padding: 8px 14px; border: 1px solid #ddd; border-radius: 10px; cursor: pointer; background: #fff; }
+    button:hover { background: #f3f3f3; }
+    #status { font-size: .9rem; color: #555; margin-left: 8px; }
+    canvas { width: 100%; height: 420px; }
+    .legend { font-size: .9rem; color: #333; margin-top: 10px; }
+    .muted { color: #666; }
+    .spacer { height: 24px; }
+    h2 { font-size: 1.1rem; margin: 20px 0 10px; }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <h1>Actividad inyectada en relación con GNI</h1>
+    <p class="hint">
+      Gráfico superior: Actividad con su mediana móvil + GNI filtrado (excluye <code>PET-AC-SF</code>).<br>
+      Gráfico inferior: Mediana móvil de actividad y todos los puntos de GNI (<code>PET-AC-SF</code> se ven con color diferente).<br>
+      Datos ordenados cronológicamente.<br>
+    </p>
+
+    <div class="card">
+      <div class="row">
+        <label for="endpoint">Endpoint FastAPI:</label>
+        <input id="endpoint" type="text" value="/pet" />
+        <button id="btnLoad">Cargar datos</button>
+        <span id="status" class="muted">Listo.</span>
+        <button id="btnPNG">Descargar PNG</button>
+        <button id="btnPNG2">Descargar PNG (abajo)</button>
+      </div>
+
+      <!-- Gráfico 1: filtro GNI por PET-AC-SF -->
+       <h2>Mediana móvil (Actividad) + GNI excluye PET-AC-SF</h2>
+      <canvas id="chart"></canvas>
+      <div class="legend muted" id="legend"></div>
+
+      <div class="spacer"></div>
+
+      <!-- Gráfico 2: mediana móvil + GNI completo (con color distinto para PET-AC-SF) -->
+      <h2>Mediana móvil (Actividad) + GNI completo</h2>
+      <canvas id="chart2"></canvas>
+      <div class="legend muted" id="legend2"></div>
+    </div>
+  </div>
+
+  <script>
+    // =================== A: utils ===================
+    function findTagValue(anyObj, tagKey) {
+      const visited = new WeakSet();
+      function _search(obj) {
+        if (obj === null || typeof obj !== 'object') return null;
+        if (visited.has(obj)) return null;
+        visited.add(obj);
+        if (Object.prototype.hasOwnProperty.call(obj, tagKey)) {
+          const t = obj[tagKey];
+          if (t && typeof t === 'object') {
+            if ('Value' in t && t.Value != null) return t.Value;
+            if ('value' in t && t.value != null) return t.value;
+          }
+          if (typeof t === 'string' || typeof t === 'number') return t;
+        }
+        if (Array.isArray(obj)) {
+          for (const item of obj) {
+            const res = _search(item);
+            if (res != null) return res;
+          }
+          return null;
+        }
+        for (const k of Object.keys(obj)) {
+          const v = obj[k];
+          const res = _search(v);
+          if (res != null) return res;
+        }
+        return null;
+      }
+      return _search(anyObj);
+    }
+
+    function parseDoseBq(raw) {
+      if (raw == null) return null;
+      const s = String(raw).trim().replace(/[\s,]/g, '');
+      const cleaned = s.match(/[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?/);
+      if (!cleaned) return null;
+      const val = Number(cleaned[0]);
+      return isFinite(val) ? val : null; // Bq
+    }
+
+    function parseDicomDateTime(da, tm) {
+      if (!da) return null;
+      const ds = String(da).trim();
+      if (!/^\d{8}$/.test(ds)) return null;
+      const year = Number(ds.slice(0, 4));
+      const month = Number(ds.slice(4, 6)) - 1;
+      const day = Number(ds.slice(6, 8));
+
+      let hh = 0, mm = 0, ss = 0, ms = 0;
+      if (tm) {
+        let ts = String(tm).trim();
+        ts = ts.replace(/[^\d.]/g, '');
+        const parts = ts.split('.');
+        const main = parts[0] || '';
+        const frac = parts[1] || '';
+        hh = Number(main.slice(0, 2) || '0');
+        mm = Number(main.slice(2, 4) || '0');
+        ss = Number(main.slice(4, 6) || '0');
+        if (frac) ms = Number((frac + '000').slice(0, 3));
+      }
+      return new Date(year, month, day, hh, mm, ss, ms);
+    }
+
+    function formatMBq(bq) { return (bq / 3.7e7); } // Bq -> mCi
+
+    function summarize(data, key = 'mbq') {
+      const vals = data.map(p => p[key]).filter(v => v != null && isFinite(v));
+      const n = vals.length;
+      if (!n) return { n: 0, min: null, max: null };
+      let min = vals[0], max = vals[0];
+      for (const v of vals) { if (v < min) min = v; if (v > max) max = v; }
+      return { n, min, max };
+    }
+
+    // ============= B: mediana móvil =============
+    function median(arr) {
+      if (!arr || !arr.length) return null;
+      const a = [...arr].sort((x, y) => x - y);
+      const m = Math.floor(a.length / 2);
+      return (a.length % 2) ? a[m] : (a[m - 1] + a[m]) / 2;
+    }
+
+    function weeklyMovingMedian(points, minCount = 30) {
+      if (!points || !points.length) return [];
+      const windowDays = 21;
+      const wms = windowDays * 24 * 3600 * 1000;
+      const half = wms / 2;
+      const out = [];
+      const pts = [...points].sort((a, b) => a.dt - b.dt);
+
+      for (let i = 0; i < pts.length; i++) {
+        const t = pts[i].dt.getTime();
+        const start = t - half;
+        const end = t + half;
+
+        const vals = [];
+        for (let j = 0; j < pts.length; j++) {
+          const tj = pts[j].dt.getTime();
+          if (tj >= start && tj <= end) vals.push(pts[j].mbq);
+        }
+        out.push({ x: i, y: vals.length >= minCount ? median(vals) : null });
+      }
+      return out;
+    }
+
+    // ============= C: render (Chart.js) =============
+    const ctx = document.getElementById('chart');
+    const ctx2 = document.getElementById('chart2');
+    let chart, chart2;
+
+    function renderChart(points) {
+      points.sort((a, b) => a.dt - b.dt);
+
+      const scatterData = points
+        .map((p, index) => ({ x: index, y: p.mbq }))
+        .filter(d => d.y != null);
+
+      const gniData = points
+        .map((p, index) => ({ x: index, y: p.gni }))
+        .filter(d => d.y != null);
+
+      const trend = weeklyMovingMedian(points, 3);
+
+      if (chart) chart.destroy();
+      chart = new Chart(ctx, {
+        type: 'scatter',
+        data: {
+          datasets: [
+            { label: 'Actividad (mCi)',  data: trend, type: 'line', yAxisID: 'y', pointRadius: 0, borderWidth: 2, tension: 0.2, spanGaps: true},
+            { label: 'GNI (SUV)', data: gniData, type: 'line', yAxisID: 'y1', pointRadius: 0}
+
+          ]
+        },
+        options: {
+          responsive: true, parsing: false,
+          scales: {
+            x: { title: { display: true, text: 'Cantidad de Datos' }, max:500 },
+            y: { title: { display: true, text: 'Actividad (mCi)' }, beginAtZero: true, min: 0,max: 8 },
+            y1: { position: 'right', title: { display: true, text: 'GNI (SUV)' }, beginAtZero: false, grid: { drawOnChartArea: false }, min: 0,max: 1 }
+          },
+          plugins: {
+            tooltip: {
+              callbacks: {
+                label: (ctx) => ctx.dataset?.yAxisID === 'y1'
+                  ? ` ${ctx.parsed.y != null ? ctx.parsed.y.toFixed(4) : '—'} SUV`
+                  : ` ${ctx.parsed.y != null ? ctx.parsed.y.toFixed(2) : '—'} mCi`
+              }
+            },
+            legend: { display: true }
+          }
+        }
+      });
+
+      const infoA = summarize(points, 'mbq');
+      const infoG = summarize(points, 'gni');
+      document.getElementById('legend').innerHTML =
+        `Registros: <b>${points.length}</b> &nbsp;|&nbsp; ` +
+        `Actividad — n: <b>${infoA.n}</b>, min: <b>${infoA.min?.toFixed?.(2) ?? '—'}</b> mCi, máx: <b>${infoA.max?.toFixed?.(2) ?? '—'}</b> mCi &nbsp;|&nbsp; ` +
+        `GNI — n: <b>${infoG.n}</b>, min: <b>${infoG.min?.toFixed?.(4) ?? '—'}</b>, máx: <b>${infoG.max?.toFixed?.(4) ?? '—'}</b>`;
+    }
+
+    // *** Gráfico 2: mediana móvil + GNI sin filtrar
+    //     Todos los puntos con un mismo color excepto los PET-AC-SF (otro color).
+    function renderChart2(pointsAll) {
+      pointsAll.sort((a, b) => a.dt - b.dt);
+
+      const trend = weeklyMovingMedian(pointsAll, 3);
+
+      // Separo GNI en dos grupos por isSF (SeriesDescription == PET-AC-SF)
+      const gniOther = [];
+      const gniSF = [];
+      pointsAll.forEach((p, index) => {
+        if (p.gni != null) {
+          const item = { x: index, y: p.gni };
+          (p.isSF ? gniSF : gniOther).push(item);
+        }
+      });
+
+      if (chart2) chart2.destroy();
+      chart2 = new Chart(ctx2, {
+        type: 'scatter',
+        data: {
+          datasets: [
+            { label: 'Mediana móvil (Actividad)', data: trend, type: 'line', yAxisID: 'y', pointRadius: 0, borderWidth: 2, tension: 0.2, spanGaps: true },
+            { label: 'GNI (SUV)', data: gniOther, yAxisID: 'y1', pointRadius: 3, pointHoverRadius: 5 },           // color por defecto
+            { label: 'GNI (SUV) — PET-AC-SF', data: gniSF, yAxisID: 'y1', pointRadius: 4, pointHoverRadius: 6}    // color distinto
+          ]
+        },
+        options: {
+          responsive: true, parsing: false,
+          scales: {
+            x: { title: { display: true, text: 'Cantidad de Datos' }, max:500 },
+            y: { title: { display: true, text: 'Actividad (mCi)' }, beginAtZero: true, min: 0,max: 10 },
+            y1: { position: 'right', title: { display: true, text: 'GNI (SUV)' }, beginAtZero: true, grid: { drawOnChartArea: false }, min: 0,max: 0.7 }
+          },
+          plugins: {
+            tooltip: {
+              callbacks: {
+                label: (ctx) => ctx.dataset?.yAxisID === 'y1'
+                  ? ` ${ctx.parsed.y != null ? ctx.parsed.y.toFixed(4) : '—'} SUV`
+                  : ` ${ctx.parsed.y != null ? ctx.parsed.y.toFixed(2) : '—'} mCi (mediana)`
+              }
+            },
+            legend: { display: true }
+          }
+        }
+      });
+
+      const infoG = summarize(pointsAll, 'gni');
+      document.getElementById('legend2').innerHTML =
+        `GNI completo — n: <b>${infoG.n}</b>, min: <b>${infoG.min?.toFixed?.(4) ?? '—'}</b>, máx: <b>${infoG.max?.toFixed?.(4) ?? '—'}</b>`;
+    }
+
+    // ============= D: carga / transformación =============
+    async function loadAndPlot() {
+      const status = document.getElementById('status');
+      const endpoint = document.getElementById('endpoint').value.trim() || '/pet';
+
+      try {
+        status.textContent = 'Consultando…';
+        const res = await fetch(endpoint, { headers: { 'Accept': 'application/json' } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        const pacientes = Array.isArray(json?.pacientes) ? json.pacientes : [];
+
+        let excluded = 0;
+        const pointsMain = []; // con filtro de GNI (arriba)
+        const pointsAll  = []; // sin filtro de GNI (abajo)
+
+        for (const doc of pacientes) {
+          const doseRaw = findTagValue(doc, '0018,1074'); // RadionuclideTotalDose
+          const dateRaw = findTagValue(doc, '0008,0020'); // StudyDate
+          const timeRaw = findTagValue(doc, '0008,0032'); // AcquisitionTime
+          const seriesDescRaw = findTagValue(doc, '0008,103e'); // SeriesDescription
+
+          const bq = parseDoseBq(doseRaw);
+          const dt = parseDicomDateTime(dateRaw, timeRaw);
+          const gniNum = Number(doc?.pet_quality?.gni_suvbw);
+          const gniVal = Number.isFinite(gniNum) ? gniNum : null;
+
+          if (dt == null) continue;
+
+          const seriesDesc = String(seriesDescRaw ?? '').trim().toUpperCase();
+          const isSF = (seriesDesc === 'PET-AC-SF');
+
+          // superior (filtrado de GNI)
+          const gniFiltered = isSF ? null : gniVal;
+          if (gniVal != null && gniFiltered == null) excluded++;
+
+          if (bq != null || gniFiltered != null) {
+            pointsMain.push({ dt, bq, mbq: bq != null ? formatMBq(bq) : null, gni: gniFiltered });
+          }
+
+          // inferior (SIN filtro de GNI) + marca isSF para colorear
+          if (bq != null || gniVal != null) {
+            pointsAll.push({ dt, bq, mbq: bq != null ? formatMBq(bq) : null, gni: gniVal, isSF });
+          }
+        }
+
+        const filteredMain = pointsMain.filter(p => (p.bq > 0 || p.gni != null));
+        const filteredAll  = pointsAll.filter(p => (p.bq > 0 || p.gni != null));
+
+        window._lastPoints_main = filteredMain;
+        window._lastPoints_all  = filteredAll;
+
+        renderChart(filteredMain);  // arriba (con filtro)
+        renderChart2(filteredAll);  // abajo (sin filtrar GNI; PET-AC-SF resaltados)
+
+        status.textContent = `OK: ${filteredMain.length} punto(s). (GNI excluidos por PET-AC-SF: ${excluded})`;
+      } catch (err) {
+        console.error(err);
+        status.textContent = 'Error al cargar. Ver consola.';
+        if (chart) chart.destroy();
+        if (chart2) chart2.destroy();
+      }
+    }
+
+    // ============= E: eventos =============
+    document.getElementById('btnLoad').addEventListener('click', loadAndPlot);
+    loadAndPlot();
+  </script>
+
+  <script>
+    document.getElementById('btnPNG').addEventListener('click', () => {
+      if (chart) {
+        const link = document.createElement('a');
+        link.href = chart.toBase64Image();
+        link.download = 'actividad_vs_tiempo.png';
+        link.click();
+      }
+    });
+    document.getElementById('btnPNG2').addEventListener('click', () => {
+      if (chart2) {
+        const link = document.createElement('a');
+        link.href = chart2.toBase64Image();               // exporta el canvas del segundo gráfico
+        link.download = 'actividad_vs_tiempo_grafico2.png';
+        link.click();
+      }
+    });
+  </script>
+</body>
+</html>

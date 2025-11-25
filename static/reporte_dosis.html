@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" /> <!-- Charset para codificación de caracteres -->
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="Description" content="Información dosimétrica por paciente: CTDIvol por serie y DLP. Tabla dosimétrica " />
+  <title> Reporte de dosis por paciente</title>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin> <!--cdn: sirven archivos estáticos-->
+  <style>
+    :root {
+      --bg: #0b0c10;
+      --panel: #121417;
+      --text: #e8eef2;
+      --muted: #9fb3c8;
+      --accent: #4da3ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      background: radial-gradient(1000px 600px at 80% -10%, #1a1f2b, var(--bg));
+      color: var(--text);
+      line-height: 1.45;
+    }
+    header {
+      padding: 22px;
+      border-bottom: 1px solid #1f2630;
+      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0));
+    }
+    h1 { margin: 0 0 6px; font-weight: 700; font-size: 22px; letter-spacing: 0.2px; }
+    p.sub { margin: 0; color: var(--muted); font-size: 14px; }
+    main {
+      padding: 20px 22px 40px;
+      max-width: 1200px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 18px;
+    }
+    .card {
+      background: #0f1217;
+      border: 1px solid #1b2330;
+      border-radius: 16px;
+      box-shadow: 0 10px 24px rgba(0,0,0,0.25);
+    }
+    .card .hd {
+      padding: 14px 16px;
+      border-bottom: 1px solid #1b2330;
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px;
+    }
+    .card .bd { padding: 16px; }
+    .controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 14px; }
+    select, input[type="number"] {
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid #263041;
+      background: #0b0f15;
+      color: var(--text);
+    }
+    .kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+    .kpi { background: #0c1016; border: 1px solid #1b2330; border-radius: 14px; padding: 12px; }
+    .kpi .label { color: var(--muted); font-size: 12px; }
+    .kpi .value { font-size: 18px; margin-top: 2px; font-weight: 700; }
+    .muted { color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #1c2430; text-align: left; }
+    th { color: var(--muted); font-weight: 600; }
+    footer { color: var(--muted); text-align: center; padding: 22px; font-size: 13px; }
+    canvas { width: 100% !important; max-height: 400px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px;
+             background: #132136; color: var(--accent); border: 1px solid #1e385a; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>CTDIvol desde <code>/ocr</code></h1>
+    <p class="sub">Información dosimétrica: valores de CTDIvol por serie y su distribución.</p>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="hd">
+        <h2>Controles</h2>
+        <div class="controls">
+          <label for="patient">Paciente:</label>
+          <select id="patient"></select>
+          <label for="bins">Bins del histograma:</label>
+          <input id="bins" type="number" value="40" min="5" max="80" step="1" />
+          <span class="badge" id="status">Cargando…</span>
+        </div>
+      </div>
+      <div class="bd">
+        <div class="kpis">
+          <div class="kpi"><div class="label">Series válidas</div><div class="value" id="kpi-n">–</div></div>
+          <div class="kpi"><div class="label">Media (mGy)</div><div class="value" id="kpi-mean">–</div></div>
+          <div class="kpi"><div class="label">Mediana</div><div class="value" id="kpi-median">–</div></div>
+          <div class="kpi"><div class="label">Min</div><div class="value" id="kpi-min">–</div></div>
+          <div class="kpi"><div class="label">Max</div><div class="value" id="kpi-max">–</div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="hd"><h2>CTDIvol por serie</h2></div>
+      <div class="bd"><canvas id="bar"></canvas></div>
+    </section>
+
+    <section class="card">
+      <div class="hd"><h2>Distribución de CTDIvol total</h2></div>
+      <div class="bd"><canvas id="hist"></canvas></div>
+    </section>
+
+    <section class="card">
+      <div class="hd"><h2>Tabla dosimetrica</h2></div>
+      <div class="bd" id="table"></div>
+    </section>
+  </main>
+
+  <footer>Si abres el archivo localmente, ajusta <code>DATA_URL</code> a <code>http://127.0.0.1:8000/ocr</code> y habilita CORS.</footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    // === Configura aquí si hace falta ===
+    // Si sirves este HTML desde FastAPI en la misma base URL, deja "/ocr".
+    // Si lo abres con file:// cambia a "http://127.0.0.1:8000/ocr".
+    const DATA_URL = "/ocr";
+
+    const selPatient = document.getElementById("patient");
+    const binsInput = document.getElementById("bins");
+    const statusEl = document.getElementById("status");
+
+    let RAW = null;
+    let chartBar = null;
+    let chartHist = null;
+
+    const num = (x) => {
+      if (x == null) return NaN;
+      const s = String(x).replace(/,/g, ".").replace(/\s+/g, "").trim();
+      const v = parseFloat(s);
+      return Number.isFinite(v) ? v : NaN;
+    };
+
+    const titleOf = (doc) => {
+      const h = doc.encabezado || {};
+      return (
+        h["Patient Name"] ||
+        h["Patient ID"] ||
+        h["Accession Number"] ||
+        doc._id ||
+        "Paciente"
+      );
+    };
+
+    const summarize = (arr) => {
+      if (!arr.length) return {n:0, mean:NaN, median:NaN, min:NaN, max:NaN};
+      const n = arr.length;
+      const sorted = [...arr].sort((a,b)=>a-b);
+      const mean = arr.reduce((a,b)=>a+b,0)/n;
+      const mid = Math.floor(n/2);
+      const median = n%2 ? sorted[mid] : (sorted[mid-1]+sorted[mid])/2;
+      return { n, mean, median, min: sorted[0], max: sorted[n-1] };
+    };
+
+    function kpiSet(stats){
+      const fmt = (x)=> Number.isFinite(x) ? x.toFixed(2) : "–";
+      document.getElementById("kpi-n").textContent = stats.n;
+      document.getElementById("kpi-mean").textContent = fmt(stats.mean);
+      document.getElementById("kpi-median").textContent = fmt(stats.median);
+      document.getElementById("kpi-min").textContent = fmt(stats.min);
+      document.getElementById("kpi-max").textContent = fmt(stats.max);
+    }
+
+    function renderBar(series){
+      const labels = series.map(s => `Serie ${s.Serie || "?"} (${s.Type || "-"})`);
+      const data = series.map(s => s._ctdi);
+      const ctx = document.getElementById("bar").getContext("2d");
+      if (chartBar) chartBar.destroy();
+      chartBar = new Chart(ctx, {
+        type: "bar",
+        data: { labels, datasets: [{ label: "CTDIvol (mGy)", data }] },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { title: { display: true, text: "Serie" } },
+            y: { title: { display: true, text: "CTDIvol (mGy)" }, beginAtZero: true }
+          }
+        }
+      });
+    }
+
+    function renderHist(values, bins){
+      const max = values.length ? Math.max(...values) : 0;
+      const min = values.length ? Math.min(...values) : 0;
+      const width = (max - min) || 1;
+      const step = width / bins;
+      const edges = Array.from({length: bins+1}, (_,i)=> min + i*step);
+      const counts = new Array(bins).fill(0);
+      for (const v of values) {
+        let idx = Math.floor((v - min) / step);
+        if (idx >= bins) idx = bins - 1;
+        if (idx < 0) idx = 0;
+        counts[idx]++;
+      }
+      const labels = counts.map((_,i)=> `${(edges[i]).toFixed(1)}–${(edges[i+1]).toFixed(1)}`);
+      const ctx = document.getElementById("hist").getContext("2d");
+      if (chartHist) chartHist.destroy();
+      chartHist = new Chart(ctx, {
+        type: "bar",
+        data: { labels, datasets: [{ label: "Frecuencia", data: counts }] },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { title: { display: true, text: "CTDIvol (mGy)" } },
+            y: { title: { display: true, text: "Series" }, beginAtZero: true, ticks: { precision: 0 } }
+          }
+        }
+      });
+    }
+
+    function renderTable(series){
+      const head = "<thead><tr><th>#</th><th>Serie</th><th>Tipo</th><th>ScanRange</th><th>CTDIvol</th><th>DLP</th><th>Phantom</th></tr></thead>";
+      const rows = series.slice(0, 20).map((s, i)=> `
+        <tr>
+          <td>${i+1}</td>
+          <td>${s.Serie || "-"}</td>
+          <td>${s.Type || "-"}</td>
+          <td>${s.ScanRange || "-"}</td>
+          <td>${Number.isFinite(s._ctdi) ? s._ctdi.toFixed(2) : "-"}</td>
+          <td>${s.DLP || "-"}</td>
+          <td>${s.Phantom || "-"}</td>
+        </tr>
+      `).join("");
+      document.getElementById("table").innerHTML = `<table>${head}<tbody>${rows}</tbody></table>`;
+    }
+
+    function allCtdiValues(data){
+      const vals = [];
+      for (const p of data) {
+        for (const s of (p.series||[])) {
+          const v = num(s.CTDIvol);
+          if (Number.isFinite(v)) vals.push(v);
+        }
+      }
+      return vals;
+    }
+
+    function updateForPatient(idx){
+      const data = RAW.pacientes || [];
+      const selected = data[idx];
+      const seriesRaw = (selected && selected.series) ? selected.series : [];
+      const series = seriesRaw.map(s => ({...s, _ctdi: num(s.CTDIvol)}))
+                              .filter(s => Number.isFinite(s._ctdi));
+      const valsAll = allCtdiValues(data);
+      kpiSet(summarize(series.map(s=>s._ctdi)));
+      renderBar(series);
+      renderHist(valsAll, parseInt(binsInput.value,10) || 10);
+      renderTable(series);
+      statusEl.textContent = "OK";
+    }
+
+    async function main(){
+      try {
+        statusEl.textContent = "Cargando…";
+        const r = await fetch(DATA_URL);
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        RAW = await r.json();
+
+        const arr = Array.isArray(RAW.pacientes) ? RAW.pacientes : [];
+        if (!arr.length) {
+          statusEl.textContent = "Sin datos";
+          return;
+        }
+
+        // Llenar selector de pacientes
+        selPatient.innerHTML = "";
+        arr.forEach((doc, i)=> {
+          const opt = document.createElement("option");
+          opt.value = i;
+          opt.textContent = titleOf(doc);
+          selPatient.appendChild(opt);
+        });
+
+        // Render inicial (primer paciente)
+        updateForPatient(0);
+
+        selPatient.addEventListener("change", (e)=> {
+          const idx = parseInt(e.target.value, 10);
+          updateForPatient(Number.isFinite(idx) ? idx : 0);
+        });
+
+        binsInput.addEventListener("change", ()=> {
+          const idx = parseInt(selPatient.value, 10) || 0;
+          updateForPatient(idx);
+        });
+
+      } catch (err){
+        statusEl.textContent = "Error";
+        console.error(err);
+      }
+    }
+
+    main();
+  </script>
+</body>
+</html>

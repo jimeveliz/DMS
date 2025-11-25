@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="Description" content="Valor tipico local de actividad inyectada en paciente especifico (70kg +/- 10kg)"  />
+  <title>VTL - Actividad inyectada</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    body { margin: 24px; }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    .canvas-wrap { height: 520px; }
+    #status, #stats { margin-top: 10px; opacity:.9 }
+    button { margin-top: 10px; padding: 8px 12px; border: 0; border-radius: 8px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>VTL - Actividad inyectada</h1>
+    <p>VTL definido para "paciente adulto tamaño estandar (70kg +/- 10kg)".</p>
+    <div class="canvas-wrap"><canvas id="chart"></canvas></div>
+    <div id="status">Cargando datos…</div>
+    <div id="stats"></div>
+    <button id="dl">Descargar PNG</button>
+  </div>
+
+  <script>
+    const ENDPOINT = "/pet";
+    const BQ_PER_mCi = 37_000_000;
+
+    // === Utils ===
+    const isObj = v => v && typeof v === "object" && !Array.isArray(v);
+    function parseNumber(x) {
+      if (x == null) return NaN;
+      if (typeof x === "number") return x;
+      if (typeof x === "string") {
+        const s = x.trim().replace(/\s+/g, "");
+        const m = s.match(/-?\d+(?:[.,]\d+)?/);
+        return m ? parseFloat(m[0].replace(",", ".")) : NaN;
+      }
+      if (Array.isArray(x)) return x.length ? parseNumber(x[0]) : NaN;
+      if (isObj(x)) {
+        if ("Value" in x) return parseNumber(x.Value);
+        if ("Alphabetic" in x) return parseNumber(x.Alphabetic);
+      }
+      return NaN;
+    }
+    function findTagEntry(node, tagKey) {
+      if (node == null) return null;
+      if (isObj(node) && Object.prototype.hasOwnProperty.call(node, tagKey)) return node[tagKey];
+      if (isObj(node) && "Value" in node) {
+        const v = node.Value;
+        if (Array.isArray(v)) { for (const it of v) { const f = findTagEntry(it, tagKey); if (f) return f; } }
+        else if (isObj(v)) { const f = findTagEntry(v, tagKey); if (f) return f; }
+      }
+      if (isObj(node)) for (const k of Object.keys(node)) { const f = findTagEntry(node[k], tagKey); if (f) return f; }
+      if (Array.isArray(node)) for (const it of node) { const f = findTagEntry(it, tagKey); if (f) return f; }
+      return null;
+    }
+    const findTagValue = (node, tag) => {
+      const e = findTagEntry(node, tag);
+      return e && "Value" in e ? e.Value : null;
+    };
+
+    // Mediana sobre los valores reales (sin redondear)
+    function median(arr) {
+      if (!arr.length) return NaN;
+      const a = [...arr].sort((x, y) => x - y);
+      const n = a.length, mid = (n - 1) / 2;
+      const lo = Math.floor(mid), hi = Math.ceil(mid);
+      return (a[lo] + a[hi]) / 2;
+    }
+
+    // Cuantil e IQR
+    function quantile(sorted, q) {
+      const pos = (sorted.length - 1) * q;
+      const b = Math.floor(pos), r = pos - b;
+      return r ? sorted[b] + r * (sorted[b + 1] - sorted[b]) : sorted[b];
+    }
+
+    // Histograma con ancho de bin por Freedman–Diaconis (fallback Sturges)
+    function makeHistogram(values) {
+      const a = [...values].sort((x, y) => x - y);
+      const n = a.length;
+      const q1 = quantile(a, 0.25), q3 = quantile(a, 0.75);
+      const iqr = Math.max(q3 - q1, 0);
+      let h = iqr > 0 ? 2 * iqr / Math.cbrt(n) : (a[n - 1] - a[0]) / Math.ceil(Math.log2(n) + 1);
+
+      const SHRINK = 0.25;
+      h = Math.max(h * SHRINK, 0.01);
+
+      const min = a[0], max = a[n - 1];
+      const start = Math.floor(min / h) * h, end = Math.ceil(max / h) * h;
+      const edges = [];
+      for (let e = start; e <= end + 1e-12; e += h) edges.push(e);
+      edges[edges.length - 1] = max;
+
+      const counts = new Array(edges.length - 1).fill(0);
+      for (const v of a) {
+        let i = edges.length - 2;
+        for (let k = 0; k < edges.length - 1; k++) {
+          if (v >= edges[k] && (v < edges[k + 1] || (k + 1 === edges.length - 1 && v <= edges[k + 1]))) { i = k; break; }
+        }
+        counts[i]++;
+      }
+      const labels = counts.map((_, i) => `${edges[i].toFixed(2)}–${edges[i + 1].toFixed(2)}`);
+      return { labels, counts, edges, binWidth: h };
+    }
+
+    function binIndexForValue(value, edges) {
+      if (value <= edges[0]) return 0;
+      for (let i = 0; i < edges.length - 1; i++) {
+        if (value >= edges[i] && value < edges[i + 1]) return i;
+      }
+      return edges.length - 2;
+    }
+
+    // ---- NUEVO: guardamos también P25 y P75 ----
+    let medianVal = NaN, medianBin = -1;
+    let q1Val = NaN, q1Bin = -1;
+    let q3Val = NaN, q3Bin = -1;
+
+    const percentilesPlugin = {
+      id: "percentilesLine",
+      afterDatasetsDraw(chart) {
+        const { top, bottom } = chart.chartArea;
+        const ctx = chart.ctx;
+        const meta = chart.getDatasetMeta(0);
+
+        function drawLine(binIdx, color, label) {
+          const bar = meta.data[binIdx];
+          if (!bar) return;
+          const x = bar.x;
+          ctx.save();
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(x, top);
+          ctx.lineTo(x, bottom);
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = color;
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = color;
+          ctx.textAlign = "center";
+          ctx.font = "12px system-ui, sans-serif";
+          ctx.fillText(label, x, top + 14);
+          ctx.restore();
+        }
+
+        if (Number.isFinite(q1Val) && q1Bin >= 0) {
+          drawLine(q1Bin, "#1f77b4", `P25: ${q1Val.toFixed(2)} mCi`);
+        }
+        if (Number.isFinite(medianVal) && medianBin >= 0) {
+          drawLine(medianBin, "red", `Mediana: ${medianVal.toFixed(2)} mCi`);
+        }
+        if (Number.isFinite(q3Val) && q3Bin >= 0) {
+          drawLine(q3Bin, "#2ca02c", `P75: ${q3Val.toFixed(2)} mCi`);
+        }
+      }
+    };
+
+    async function main() {
+      const $status = document.getElementById("status");
+      const $stats = document.getElementById("stats");
+      try {
+        const res = await fetch(ENDPOINT);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+
+        const actividades = [];
+        const pacientes = Array.isArray(data.pacientes) ? data.pacientes : [];
+
+        for (const p of pacientes) {
+          const tags = p?.first_instance?.dicom_tags || {};
+          const pesoVal = findTagValue(tags, "0010,1030");
+          const pesoKg = parseNumber(pesoVal);
+          const pesoInt = Number.isFinite(pesoKg) ? Math.trunc(pesoKg) : NaN;
+          if (!Number.isFinite(pesoInt) || pesoInt < 60 || pesoInt > 80) continue;
+
+          const bqVal = findTagValue(tags, "0018,1074");    // RadionuclideTotalDose (Bq)
+          const bq = parseNumber(bqVal);
+          if (!Number.isFinite(bq) || bq <= 0) continue;
+
+          const mCi = bq / BQ_PER_mCi;
+          actividades.push(mCi);
+        }
+
+        if (!actividades.length) {
+          $status.textContent = "Sin datos válidos para el filtro 60–80 kg.";
+          return;
+        }
+
+        // calculamos P25, mediana, P75 sobre una copia ordenada
+        const sorted = [...actividades].sort((a, b) => a - b);
+        q1Val = quantile(sorted, 0.25);
+        medianVal = quantile(sorted, 0.5);
+        q3Val = quantile(sorted, 0.75);
+
+        const hist = makeHistogram(actividades);
+        q1Bin = binIndexForValue(q1Val, hist.edges);
+        medianBin = binIndexForValue(medianVal, hist.edges);
+        q3Bin = binIndexForValue(q3Val, hist.edges);
+
+        const ctx = document.getElementById("chart").getContext("2d");
+        Chart.register(percentilesPlugin);
+        const chart = new Chart(ctx, {
+          type: "bar",
+          data: {
+            labels: hist.labels,
+            datasets: [{
+              label: "Número de pacientes",
+              data: hist.counts,
+              backgroundColor: "rgba(96,165,250,0.35)",
+              borderColor: "rgba(96,165,250,0.35)",
+              borderWidth: 1,
+              barPercentage: 1.0,
+              categoryPercentage: 1.0
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: {
+              x: { title: { display: true, text: "Actividad inyectada (mCi)" }, offset: false },
+              y: { title: { display: true, text: "Número de pacientes" }, beginAtZero: true, ticks: { precision: 0 } }
+            }
+          }
+        });
+
+        $status.textContent = "Listo.";
+        const medianMBq = medianVal * 37;
+        const q1MBq = q1Val * 37;
+        const q3MBq = q3Val * 37;
+        $stats.textContent =
+          `N = ${actividades.length} | P25 = ${q1Val.toFixed(2)} mCi (${q1MBq.toFixed(0)} MBq) | ` +
+          `Mediana = ${medianVal.toFixed(2)} mCi (${medianMBq.toFixed(0)} MBq) | ` +
+          `P75 = ${q3Val.toFixed(2)} mCi (${q3MBq.toFixed(0)} MBq)`;
+
+        document.getElementById("dl").onclick = () => {
+          const a = document.createElement("a");
+          a.href = chart.toBase64Image();
+          a.download = "histograma_actividad_mCi.png";
+          a.click();
+        };
+      } catch (e) {
+        document.getElementById("status").textContent = "Error: " + e.message;
+        console.error(e);
+      }
+    }
+    main();
+  </script>
+</body>
+</html>
