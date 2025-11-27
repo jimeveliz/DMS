@@ -1,0 +1,11 @@
+pyorthanc
+pydicom
+numpy
+opencv-python-headless
+pandas
+pymongo
+python-dotenv
+schedule
+easyocr
+pillow
+httpx
