@@ -41,17 +41,17 @@ QUALITY_BINS = os.getenv("QUALITY_BINS", "fd")
 SKIP_DYNAMIC_PET = os.getenv("SKIP_DYNAMIC_PET", "true").lower() == "true"
 
 # Orthanc
-ORTHANC_URL = os.getenv("ORTHANC_URL", "http://10.73.161.56:8042")
-ORTHANC_USER = os.getenv("ORTHANC_USER", "fisica")
-ORTHANC_PASS = os.getenv("ORTHANC_PASS", "Fisica4518")
+ORTHANC_URL = os.getenv("ORTHANC_URL", "-")
+ORTHANC_USER = os.getenv("ORTHANC_USER", "-")
+ORTHANC_PASS = os.getenv("ORTHANC_PASS", "-")
 
 # MongoDB (preferir MONGO_URI completa; si no, construir con partes)
 DB_NAME = os.getenv("DB_NAME", "CondorDB")
 _MONGO_URI_ENV = os.getenv("MONGO_URI")
-_MONGO_HOST = os.getenv("MONGO_HOST", "10.73.173.21")
+_MONGO_HOST = os.getenv("MONGO_HOST", "-)
 _MONGO_PORT = as_int(os.getenv("MONGO_PORT", None), 27017)
-_MONGO_USERNAME = os.getenv("MONGO_USERNAME", "fisica")
-_MONGO_PASSWORD = os.getenv("MONGO_PASSWORD", "F1s1c44518")
+_MONGO_USERNAME = os.getenv("MONGO_USERNAME", "-")
+_MONGO_PASSWORD = os.getenv("MONGO_PASSWORD", "-")
 _MONGO_AUTHSOURCE = os.getenv("MONGO_AUTHSOURCE", "admin")
 
 if _MONGO_URI_ENV:
